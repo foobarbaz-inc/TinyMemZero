@@ -17,9 +17,28 @@ Note that we don't combine the main with ray_trainer as ray_trainer is used by o
 
 from verl import DataProto
 import torch
-from verl.utils.reward_score import gsm8k, math, multiply, countdown
+from verl.utils.reward_score import gsm8k, math, multiply, countdown, memory_tool
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
+from typing import Dict, List, Optional, Union, Any
+import transformers
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    PreTrainedModel,
+    PreTrainedTokenizer
+)
 
+# Local imports
+from verl.models.model import ModelWithToolUse
+from verl.utils.data import DataProto, DataProtoItem
+from verl.memory_tools import MemoryTool  # Your memory tool implementation
+
+# Optional logging/tracking imports
+import wandb
+import logging
+from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
 
 def _select_rm_score_fn(data_source):
     if data_source == 'openai/gsm8k':
@@ -30,9 +49,38 @@ def _select_rm_score_fn(data_source):
         return multiply.compute_score
     elif "countdown" in data_source:
         return countdown.compute_score
+    elif "memory_tool" in data_source:
+        return memory_tool.compute_score
     else:
         raise NotImplementedError
 
+def setup_model(
+    model_path: str,
+    tokenizer_path: Optional[str] = None,
+    device: str = "cuda"
+) -> tuple[ModelWithToolUse, PreTrainedTokenizer]:
+    """Setup model and tokenizer with memory tool capabilities."""
+    
+    # Initialize tokenizer
+    tokenizer_path = tokenizer_path or model_path
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    
+    # Initialize base model
+    base_model = AutoModelForCausalLM.from_pretrained(
+        model_path,
+        device_map="auto" if device == "cuda" else None
+    )
+    
+    # Initialize memory tool
+    memory_tool = MemoryTool()
+    
+    # Create wrapped model with tool use capability
+    model = ModelWithToolUse(base_model, tokenizer, memory_tool)
+    
+    if device == "cuda":
+        model = model.cuda()
+    
+    return model, tokenizer
 
 class RewardManager():
     """The reward manager.
