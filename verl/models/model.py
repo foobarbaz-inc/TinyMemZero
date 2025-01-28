@@ -9,6 +9,7 @@ class ModelWithToolUse(torch.nn.Module):
         self.base_model = base_model
         self.tokenizer = tokenizer
         self.memory_tool = memory_tool
+        self.max_length = 2048  # or whatever your model's max length is
         
         # Add special tokens if not present
         special_tokens = {
@@ -29,155 +30,221 @@ class ModelWithToolUse(torch.nn.Module):
         max_new_tokens: int = 50,
         **kwargs
     ) -> Dict:
-        """Generation with tool use capability."""
-        return self._generate_with_tool_use(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            max_new_tokens=max_new_tokens,
-            **kwargs
+        """Generation with tool use capability for inference."""
+        batch_size = input_ids.size(0)
+        all_sequences = []
+        all_tool_calls = []
+        
+        # Remove generation-specific kwargs that we'll set explicitly
+        generation_kwargs = kwargs.copy()
+        for key in ['return_dict_in_generate', 'output_scores', 'max_new_tokens']:
+            generation_kwargs.pop(key, None)
+        
+        for i in range(batch_size):
+            current_ids = input_ids[i:i+1]
+            current_mask = attention_mask[i:i+1]
+            sequence_tool_calls = []
+            
+            for _ in range(max_new_tokens):
+                # Generate next token
+                outputs = self.base_model.generate(
+                    input_ids=current_ids,
+                    attention_mask=current_mask,
+                    max_new_tokens=1,
+                    return_dict_in_generate=True,
+                    output_scores=True,
+                    **generation_kwargs
+                )
+                next_token = outputs.sequences[:, -1:]
+                
+                # Check for memory tool trigger
+                if next_token[0, 0].item() == self.memory_start_token_id:
+                    # Collect memory query
+                    query_ids = []
+                    query_outputs = current_ids
+                    
+                    while True:
+                        query_next = self.base_model.generate(
+                            input_ids=query_outputs,
+                            attention_mask=torch.ones_like(query_outputs),
+                            max_new_tokens=1,
+                            return_dict_in_generate=True,
+                            output_scores=True,
+                            **generation_kwargs
+                        )
+                        token = query_next.sequences[:, -1:]
+                        query_ids.append(token)
+                        query_outputs = torch.cat([query_outputs, token], dim=1)
+                        
+                        if token[0, 0].item() == self.memory_end_token_id:
+                            break
+                    
+                    # Execute tool call
+                    query_text = self.tokenizer.decode(torch.cat(query_ids, dim=1)[0])
+                    memory_result = self.memory_tool.query(query_text)
+                    sequence_tool_calls.append({"query": query_text, "result": memory_result})
+                    
+                    # Add result to sequence
+                    result_ids = self.tokenizer.encode(
+                        memory_result,
+                        add_special_tokens=False,
+                        return_tensors='pt'
+                    ).to(current_ids.device)
+                    
+                    current_ids = torch.cat([current_ids, result_ids], dim=1)
+                    current_mask = torch.cat([
+                        current_mask,
+                        torch.ones_like(result_ids)
+                    ], dim=1)
+                else:
+                    current_ids = torch.cat([current_ids, next_token], dim=1)
+                    current_mask = torch.cat([
+                        current_mask,
+                        torch.ones_like(next_token)
+                    ], dim=1)
+                
+                if next_token[0, 0].item() == self.tokenizer.eos_token_id:
+                    break
+            
+            all_sequences.append(current_ids)
+            all_tool_calls.append(sequence_tool_calls)
+        
+        # Pad sequences to same length
+        padded_sequences = torch.nn.utils.rnn.pad_sequence(
+            [seq[0] for seq in all_sequences],
+            batch_first=True,
+            padding_value=self.tokenizer.pad_token_id
         )
+        
+        return type('GenerationOutput', (), {
+            'sequences': padded_sequences,
+            'tool_calls': all_tool_calls
+        })
 
     def forward(
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         labels: Optional[torch.Tensor] = None,
+        return_tool_calls: bool = False,
         **kwargs
     ) -> Dict:
-        """Forward pass with tool handling during inference."""
-        if self.training or labels is not None:
-            # Regular training forward pass
-            return self.base_model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                **kwargs
-            )
-        else:
-            # Inference mode with tool handling
-            max_new_tokens = kwargs.pop('max_new_tokens', 50)
-            return self._generate_with_tool_use(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=max_new_tokens,
-                **kwargs
-            )
-
-    def _generate_with_tool_use(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        max_new_tokens: int = 50,
-        **kwargs
-    ) -> Dict:
-        """Handle generation with tool interruption and continuation."""
-        outputs = []
-        tool_calls = []
+        """Forward pass with tool handling during training."""
+        if not self.training and labels is None:
+            # For inference without labels, use generate
+            return self.generate(input_ids, attention_mask, **kwargs)
         
-        # Generate tokens one at a time
-        current_ids = input_ids
-        current_mask = attention_mask
+        batch_size = input_ids.size(0)
+        tool_calls_per_sequence = [[] for _ in range(batch_size)]
+        new_input_ids = []
+        new_attention_masks = []
+        new_labels = [] if labels is not None else None
         
-        # Remove generation-specific kwargs that we don't want to pass to inner generate calls
-        inner_kwargs = kwargs.copy()
-        for key in ['return_dict_in_generate', 'output_scores', 'max_new_tokens']:
-            inner_kwargs.pop(key, None)
-        
-        for _ in range(max_new_tokens):
-            # Get next token prediction using generate() for one step
-            outputs = self.base_model.generate(
-                input_ids=current_ids,
-                attention_mask=current_mask,
-                max_new_tokens=1,
-                **inner_kwargs
-            )
+        for i in range(batch_size):
+            current_ids = input_ids[i:i+1]
+            current_mask = attention_mask[i:i+1]
+            current_labels = labels[i:i+1] if labels is not None else None
             
-            next_token_id = outputs[0, -1].unsqueeze(0)
-            
-            # Check for memory tool trigger
-            if next_token_id.item() == self.memory_start_token_id:
-                # Collect memory query and execute tool call
-                query_ids, query_mask, memory_result = self._handle_memory_call(
-                    current_ids,
-                    current_mask,
-                    inner_kwargs
+            # Process sequence until we hit a memory token or the end
+            while current_ids.size(1) < self.max_length:
+                outputs = self.base_model(
+                    input_ids=current_ids,
+                    attention_mask=current_mask,
+                    labels=current_labels,
+                    **kwargs
                 )
                 
-                # Record tool usage
-                tool_calls.append({
-                    "query": self.tokenizer.decode(query_ids[0]),
-                    "result": memory_result
-                })
+                next_token = torch.argmax(outputs.logits[:, -1:], dim=-1)
                 
-                # Update current sequence with tool results
-                result_ids = self.tokenizer.encode(
-                    memory_result,
-                    add_special_tokens=False,
-                    return_tensors='pt'
-                ).to(current_ids.device)
+                if next_token.item() == self.memory_start_token_id:
+                    # Handle memory tool call (similar to generate method)
+                    query_ids = []
+                    query_outputs = current_ids
+                    
+                    while True:
+                        query_next = self.base_model.generate(
+                            input_ids=query_outputs,
+                            attention_mask=torch.ones_like(query_outputs),
+                            max_new_tokens=1,
+                            **kwargs
+                        )
+                        token = query_next[:, -1:]
+                        query_ids.append(token)
+                        query_outputs = torch.cat([query_outputs, token], dim=1)
+                        
+                        if token[0, 0].item() == self.memory_end_token_id:
+                            break
+                    
+                    query_text = self.tokenizer.decode(torch.cat(query_ids, dim=1)[0])
+                    memory_result = self.memory_tool.query(query_text)
+                    tool_calls_per_sequence[i].append({
+                        "query": query_text,
+                        "result": memory_result
+                    })
+                    
+                    result_ids = self.tokenizer.encode(
+                        memory_result,
+                        add_special_tokens=False,
+                        return_tensors='pt'
+                    ).to(current_ids.device)
+                    
+                    current_ids = torch.cat([current_ids, result_ids], dim=1)
+                    current_mask = torch.cat([
+                        current_mask,
+                        torch.ones_like(result_ids)
+                    ], dim=1)
+                    
+                    if current_labels is not None:
+                        current_labels = torch.cat([
+                            current_labels,
+                            torch.full_like(result_ids, -100)
+                        ], dim=1)
+                else:
+                    current_ids = torch.cat([current_ids, next_token], dim=1)
+                    current_mask = torch.cat([
+                        current_mask,
+                        torch.ones_like(next_token)
+                    ], dim=1)
+                    
+                    if current_labels is not None:
+                        current_labels = torch.cat([
+                            current_labels,
+                            next_token
+                        ], dim=1)
                 
-                current_ids = torch.cat([current_ids, result_ids], dim=1)
-                current_mask = torch.cat([
-                    current_mask,
-                    torch.ones_like(result_ids)
-                ], dim=1)
-            else:
-                # Regular token generation
-                current_ids = torch.cat([
-                    current_ids,
-                    next_token_id.unsqueeze(0)
-                ], dim=1)
-                current_mask = torch.cat([
-                    current_mask,
-                    torch.ones(1, 1).to(current_mask.device)
-                ], dim=1)
+                if next_token.item() == self.tokenizer.eos_token_id:
+                    break
             
-            # Check for end of generation
-            if next_token_id.item() == self.tokenizer.eos_token_id:
-                break
+            new_input_ids.append(current_ids)
+            new_attention_masks.append(current_mask)
+            if new_labels is not None:
+                new_labels.append(current_labels)
         
-        return type('GenerationOutput', (), {
-            'sequences': current_ids,
-            'scores': None,  # Add if needed
-            'tool_calls': tool_calls
-        })
-
-    def _handle_memory_call(
-        self,
-        current_ids: torch.Tensor,
-        current_mask: torch.Tensor,
-        generation_kwargs: dict,
-    ) -> Tuple[torch.Tensor, torch.Tensor, str]:
-        """Handle memory tool call and return query tokens and result."""
-        query_tokens = []
+        # Pad sequences
+        padded_ids = torch.nn.utils.rnn.pad_sequence(
+            [ids[0] for ids in new_input_ids],
+            batch_first=True,
+            padding_value=self.tokenizer.pad_token_id
+        )
+        padded_masks = torch.nn.utils.rnn.pad_sequence(
+            [mask[0] for mask in new_attention_masks],
+            batch_first=True,
+            padding_value=0
+        )
         
-        while len(query_tokens) < 100:  # max query length safeguard
-            outputs = self.base_model.generate(
-                input_ids=current_ids,
-                attention_mask=current_mask,
-                max_new_tokens=1,
-                **generation_kwargs
-            )
-            
-            next_token_id = outputs[0, -1].item()
-            query_tokens.append(next_token_id)
-            
-            if next_token_id == self.memory_end_token_id:
-                break
-            
-            current_ids = torch.cat([
-                current_ids,
-                outputs[:, -1:],
-            ], dim=1)
-            current_mask = torch.cat([
-                current_mask,
-                torch.ones(1, 1).to(current_mask.device)
-            ], dim=1)
+        # Final forward pass
+        outputs = self.base_model(
+            input_ids=padded_ids,
+            attention_mask=padded_masks,
+            labels=torch.nn.utils.rnn.pad_sequence(
+                [l[0] for l in new_labels],
+                batch_first=True,
+                padding_value=-100
+            ) if new_labels is not None else None,
+            **kwargs
+        )
         
-        # Convert query tokens to text (excluding special tokens)
-        query_text = self.tokenizer.decode(query_tokens[:-1])  # exclude end token
+        if return_tool_calls:
+            outputs['tool_calls'] = tool_calls_per_sequence
         
-        # Execute memory tool call
-        memory_result = self.memory_tool.query(query_text)
-        
-        return current_ids, current_mask, memory_result 
+        return outputs 
