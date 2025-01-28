@@ -32,9 +32,8 @@ def test_memory_tool_generation():
     # Create a test prompt that should trigger memory use
     test_prompt = (
         "Let me think about this step by step:\n"
-        "1. First, I need to check something.\n"
-        "<memory>What is Einstein's birth year?</memory>\n"
-        "2. Based on this information, I can conclude..."
+        "Please output <memory>query</memory> to look something up.\n"
+        "What is Einstein's birth year?\n"
     )
     
     # Tokenize input
